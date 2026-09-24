@@ -260,11 +260,11 @@ func TestChatLogsErrorRow(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 		h.ServeHTTP(rec, req)
-		if rec.Code != 503 {
+		if rec.Code != http.StatusPaymentRequired {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"| u1 ", "| 503 |", "tok=-"} {
+	for _, want := range []string{"| u1 ", "| 402 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}

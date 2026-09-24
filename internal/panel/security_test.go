@@ -3,6 +3,7 @@ package panel
 import (
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -70,7 +71,8 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
+	// 允许用于缓存失效的版本参数，仍要求同源 app.js 外链且无内联正文。
+	if !regexp.MustCompile(`<script src="app\.js(?:\?[^"<>]*)?"></script>`).MatchString(body) {
 		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归

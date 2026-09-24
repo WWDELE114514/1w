@@ -701,7 +701,7 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	}
 }
 
-func TestChatAllUnavailableReturns503(t *testing.T) {
+func TestChatCreditsExhaustedReturns402(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 402, `{"code":1,"msg":"余额不足"}`, false
 	})
@@ -712,13 +712,19 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
+	if rec.Code != http.StatusPaymentRequired {
 		t.Errorf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	var e map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &e)
-	if e["error"] == nil {
-		t.Errorf("want error envelope: %s", rec.Body)
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Error.Code != "upstream_credits_exhausted" {
+		t.Errorf("want upstream_credits_exhausted: %s", rec.Body)
 	}
 }
 
