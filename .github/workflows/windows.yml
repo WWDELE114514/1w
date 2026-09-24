@@ -1,0 +1,60 @@
+name: Build Windows Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'internal/**'
+      - 'config.example.json'
+      - 'scripts/windows/**'
+      - '.github/workflows/windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Test
+        run: go test -timeout 5m ./...
+
+      - name: Build Windows executables
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -trimpath -tags timetzdata -ldflags="-s -w" -o dist/wb2api.exe ./cmd/server
+          go build -trimpath -tags timetzdata -ldflags="-s -w" -o dist/login.exe ./cmd/login
+          go build -trimpath -tags timetzdata -ldflags="-s -w" -o dist/signin_bin.exe ./cmd/signin
+          go build -trimpath -tags timetzdata -ldflags="-s -w" -o dist/credit.exe ./cmd/credit
+
+      - name: Package
+        run: |
+          cp config.example.json LICENSE dist/
+          cp scripts/windows/* dist/
+          printf '%s\n' "$GITHUB_SHA" > dist/BUILD_COMMIT.txt
+          cd dist
+          sha256sum *.exe > SHA256SUMS.txt
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy2api-windows-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
