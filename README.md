@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  本仓库在上游之上<b>只新增三项功能</b>：🔑 API 密钥分发 · 🧠 模型编排 · 🔌 协议兼容层
+  本仓库在上游之上<b>只新增三项功能</b>：🔑 API 密钥分发 · 🧠 模型编排 · 🔌 多协议接入
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## 这是什么
 
-三层 fork，**上游的全部能力一个没动**，只在其上加了密钥分发、模型编排与协议兼容层：
+三层 fork，**上游的全部能力一个没动**，只在其上加了密钥分发、模型编排与多协议接入：
 
 | 层 | 项目 | 说明 |
 |---|---|---|
@@ -63,47 +63,28 @@ docker compose up -d
 
 ---
 
-## 🆕 新增一：API 密钥分发（`wbk_` 子钥匙）
+## 🆕 新增一：API 密钥分发（子钥匙）
 
-**解决什么问题**：原来全站只有 `config.json` 里的一把管理员 `api_key`，要么不给人用，要么给人用就等于交出全部权限。现在可以按需签发子钥匙，每把自带额度与边界，随时停用、随时改额度。
+**解决什么问题**：原来全站只有一把管理员钥匙 —— 要么不给人用，要么给人用就等于把全部权限交出去。现在可以按需签发子钥匙，每把自带额度和边界，随时停用、随时改额度。
 
-| 项目 | 说明 |
+**在哪操作**：面板左侧 **API 密钥** 页 → 右上角「新建密钥」。列表里每一行都能直接停用、改额度、看用量。
+
+**一把钥匙能限制什么**（都在新建窗口里填，填 0 或留空 = 不限制）
+
+| 窗口里的项 | 作用 |
 |---|---|
-| 入口 | 面板 → **API 密钥** 页（增删改查 / 停用 / 看用量）；接口 `GET/POST/PATCH/DELETE /panel/api/keys`，用管理员 key 鉴权 |
-| 明文 | 前缀 `wbk_`，**只在创建时展示一次**；库里只存 `sha256(明文)`，落盘 `data/keys.json`（原子写，权限 600） |
-| 鉴权顺序 | `wbk_` 前缀 → 走密钥库判定；否则回退原 `api_key` 校验（**不开密钥库时零回归**） |
+| 密钥名称 | 用来区分用途，必填 |
+| 版本归属 | 限定这把钥匙只能走国内版或国际版，默认不限 |
+| 有效期（天） | 到期自动失效，填 0 = 长期有效 |
+| 最大来源 IP 数 | 限制最多允许几个不同 IP 用过这把钥匙 |
+| Token 用量上限 | 用超了就拒绝 |
+| 积分用量上限 | 用超了就拒绝 |
+| 来源 IP 白名单 | 只允许名单内的 IP 调用，支持网段写法 |
+| 模型白名单 | 只允许调用名单内的模型（含虚拟模型 `auto`），留空 = 全部放行 |
 
-**一把钥匙能限制什么**
+钥匙明文以 `wbk_` 开头，**只在创建弹窗里显示这一次**，关掉就找不回来了 —— 服务端只存它的摘要，不存明文，谁也捞不出来。
 
-| 字段 | 含义 |
-|---|---|
-| `name` | 名称（必填，≤64 字符） |
-| `realm` | 版本归属：`cn` / `global`，空 = 不限 |
-| `ip_allowlist` | IP 白名单，支持精确 IP 与 CIDR，空 = 不限制 |
-| `max_ips` | 最多允许几个不同 IP 用过，0 = 不限 |
-| `models` | 模型白名单（含虚拟模型 `auto`），空 = 全部 |
-| `quota` / `quota_credit` | token 额度 / 积分额度，0 = 不限 |
-| `expires_at` | 过期时间（RFC3339），空 = 不过期 |
-| `enabled` | 停用开关 |
-
-**怎么用**
-
-```bash
-curl http://HOST:7863/v1/chat/completions \
-  -H "Authorization: Bearer wbk_xxxxxxxxxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}'
-```
-
-**错误口径**（刻意区分，方便客户端判断要不要重试）
-
-| 场景 | 状态码 |
-|---|---|
-| 停用 / 过期 | 403 |
-| 额度用尽（token 或积分） | 429 |
-| IP 不在白名单 / IP 超限 / 版本不匹配 / 模型不在白名单 | 400 |
-
-**安全默认**：`trust_proxy` 默认 `false` —— 只认 TCP 对端地址，**不读可伪造的 `X-Forwarded-For` / `X-Real-IP`**，避免伪造头绕过 IP 白名单。确实挂在反向代理后面、需要真实客户端 IP 时，才在 `config.json` 里设 `"trust_proxy": true`。
+带 `wbk_` 前缀的钥匙走这套判定，其余的仍按原来的管理员钥匙校验。**一把子钥匙都不建的话，跟以前完全一样**。
 
 ---
 
@@ -113,124 +94,88 @@ curl http://HOST:7863/v1/chat/completions \
 
 **一句话目的**：把每天能白嫖的额度尽量用满；免费窗口过期、额度波动、被限流时**自动**换模型，全程不用手动改配置。
 
-做法只有一个：客户端写 `model=auto`，剩下的全交给网关。具名模型（`cn:hy3` 之类）不受任何影响，照旧原样透传。
+**怎么触发**：得先在面板「配置」页 →「模型编排」那里打开「启用模型编排」开关并点「保存配置」，然后请求里模型名传下面这几种，网关才会接管：
+
+| 你传的模型名 | 结果 |
+|---|---|
+| `auto` | 交给编排：按当前钟点在「白天主模型」和「夜间主模型」之间挑，降级链不挑版本 |
+| `cn:auto` | 交给编排，但降级链只保留国内版模型 |
+| `global:auto` | **默认配置下不生效** —— 面板里填的主模型和降级链全是国内版，没有国际版候选，这个名字会原样发给上游（基本上是 404）。想让国际版也编排，先往「降级链」里加国际版模型 |
+| `cn:hy3`、`cn:deepseek-v4.1-flash` 这类具体名字 | 就是那个模型，原样透传，不参与编排 |
+
+上面几行提到的「白天主模型」「夜间主模型」「降级链」，就是面板「配置」页 →「模型编排」里那几个输入框，改完点「保存配置」立刻生效，不用重启。
+
+三个接口都认这几种写法。模型列表里能查到的虚拟名是 `auto` 和 `cn:auto` 两个。
 
 - **按钟点自动换主模型**：白天吃白天的免费额度，夜里吃夜里的免费窗口，到点自动切回。
-- **出问题自动沿链降级**：主模型被限流 / 积分耗尽 / 上游报错 / 返回空正文，就沿降级链往下挑下一个能用的。
+- **出问题自动往下顶**：首选模型被限流 / 积分耗尽 / 上游报错 / 返回空正文，就按降级链往下挑下一个能用的。
 - **优惠到期不用管**：链是按「免费 → 低倍率 → 兜底」排的，免费额度没了自然落到下一个，配置一行不用动。
 
 ### 自动切换逻辑
 
-| 时段（Asia/Shanghai） | 主模型 | 完整候选链（链首首选，失败才往下走） |
-|---|---|---|
-| **白天 08:00–23:00** | `cn:hy3`（免费） | `cn:hy3` → `cn:deepseek-v4.1-flash`（0.03x）→ `cn:glm-5.3-flash`（0.06x，1M 上下文、能看图）→ `cn:hy3-x`（0.05x，兜底） |
-| **夜间 23:00–08:00** | `cn:hy4-preview`（夜间老用户免费窗口） | `cn:hy4-preview` → `cn:hy3` → `cn:deepseek-v4.1-flash` → `cn:glm-5.3-flash` → `cn:hy3-x` |
+下面是面板里的默认配置，每一项都能在「配置」页 →「模型编排」里改：白天主模型、夜间主模型、白天窗口（起 / 止 小时，按北京时间）、降级链（逗号分隔，按顺序尝试）。
 
-- 切换**不是定时任务**：每次请求进来按当前小时判定，08:00 一到请求自然回到 `cn:hy3`，无需重启、无需改配置。
-- 白天主模型 `cn:hy3` 本身也在降级链里 —— 夜里 `cn:hy4-preview` 挂掉时接上的就是它；白天它已是链首，链里重复出现的那一项会被**自动去重跳过**。所以一条 `fallback` 同时服务昼夜两个时段。
+| 时段 | 首选模型 | 首选不行就依次往下试 |
+|---|---|---|
+| **白天 08:00–23:00** | `cn:hy3`（免费） | `cn:deepseek-v4.1-flash`（0.03x）→ `cn:glm-5.3-flash`（0.06x，1M 上下文、能看图）→ `cn:hy3-x`（0.05x，兜底） |
+| **夜间 23:00–08:00** | `cn:hy4-preview`（夜间老用户免费窗口） | `cn:hy3` → `cn:deepseek-v4.1-flash` → `cn:glm-5.3-flash` → `cn:hy3-x` |
+
+- 切换**不是定时任务**：每次请求进来按当前钟点判定，08:00 一到请求自然回到 `cn:hy3`，无需重启、无需改配置。
+- 白天主模型 `cn:hy3` 本身也在降级链里 —— 夜里 `cn:hy4-preview` 挂掉时接上的就是它；白天它已经是首选，链里重复的那一项会被**自动跳过**。所以一条降级链同时服务昼夜两个时段。
 - 链尾 `cn:hy3-x` 是兜底位：只要账号还有额度就一定有响应，不会把请求打空。
 
-### 配置（`config.json` 的 `auto_model` 段；面板「配置」页可直接改，保存热生效）
+### 具体模型名也能挂降级链
 
-```json
-"auto_model": {
-  "enabled": true,
-  "day_primary":   "cn:hy3",
-  "night_primary": "cn:hy4-preview",
-  "day_start": 8,
-  "day_end": 23,
-  "fallback": ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "on_empty": true,
-  "virtual_id": "auto",
-  "override": true
-}
-```
-
-| 字段 | 含义 |
-|---|---|
-| `enabled` | 编排开关。**代码缺省 false**（不写这段 = `auto` 当普通模型名直出，零回归）；本仓库 `config.example.json` 给的是 `true`（开箱即薅额度） |
-| `day_primary` / `night_primary` | 白天 / 夜间主模型（带 realm 前缀） |
-| `day_start` / `day_end` | 白天窗口 `[start, end)`，按 **Asia/Shanghai 小时**判定，默认 8 / 23 |
-| `fallback` | 有序降级链（带 realm 前缀），昼夜共用；与主模型重复项自动跳过 |
-| `virtual_id` / `override` | 虚拟模型名（默认 `auto`）；与上游真实模型同名时是否强行接管（上游 cn 侧下发过同名 `auto`，想接管就开 true 或改名） |
-| `on_empty` | 上游 200 但正文为空也算失败并降级（部分模型 `reasoning_effort=max` 吃满预算会返回空），默认 true |
-| `fallback_on` | 可触发降级的错误类别，空 = 内置默认集合 |
-
-### 什么情况会降级
-
-429 软限流 · 402 额度耗尽 · 上游 `11102` · 5xx · 无健康账号 · 上游 200 空正文（`on_empty`）。
-
-反例（**不降级**）：内容拦截、参数错误、上下文超长、请求体解析失败 —— 这些是请求本身的问题，换任何模型都一样撞墙，直接 fail-fast。
-
-### 具名模型也能挂同一条链
-
-`model_fallback` 的键是客户端写的模型名（逐字匹配），这样即使客户端写死 `cn:hy3`，也能享受和 `auto` 一样的降级：
+传具体模型名（比如 `cn:deepseek-v4.1-flash`）就是它自己，跟 `auto` 没关系，不受编排影响。
+但可以在面板「配置」页 →「模型编排」的「具名模型降级表」里给它单独配一条链 —— 它挂了就往下顶：
 
 ```json
 "model_fallback": {
   "cn:hy3":                 ["cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:hy4-preview":         ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:deepseek-v4.1-flash": ["cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:glm-5.3-flash":       ["cn:hy3-x"]
+  "cn:deepseek-v4.1-flash": ["cn:glm-5.3-flash", "cn:hy3-x"]
 }
 ```
 
-两条链可叠加：链上每一项再按本表递归展开（限深 3、链长 ≤ 8、去重）。
-
-### 怎么知道实际用了哪个模型
-
-响应头 `X-WB2A-Routed-Model`：
-
-```bash
-curl -i http://HOST:7863/v1/chat/completions \
-  -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":false}'
-# 白天：X-WB2A-Routed-Model: cn:hy3
-# 夜里：X-WB2A-Routed-Model: cn:hy4-preview
-```
-
-**一处语义修正**：上游业务码 `14018`（`Credits exhausted`，账号积分耗尽）原本被归进 `rate_limit_exceeded` 当限流处理 —— 重试不可能成功。现已单列为 `402 upstream_credits_exhausted`，提示直接写明「需充值 / 等额度重置」。
+左边写模型名，必须跟请求里传的一字不差；右边写它挂了之后要顶上的候选。两条链叠加展开，自动去重，最多 8 个、递归 3 层。
+没写进这张表的模型名，就是原样透传，没有降级。
 
 ---
 
 <a id="protocol-compat"></a>
 
-## 🆕 新增三：协议兼容层（`/v1/responses` + `/v1/messages`）
+## 🆕 新增三：多协议接入（Claude Code / Codex 等客户端直接连）
 
-**解决什么问题**：原来网关只认 OpenAI 的 `/v1/chat/completions`。Claude Code 等客户端走的是 Anthropic Messages API（`/v1/messages`），新版 OpenAI SDK / Codex 走的是 Responses API（`/v1/responses`），接上来直接 404。现在两类协议都能直接打进来，复用同一套账号池、密钥分发与模型编排。
+**解决什么问题**：原来网关只认 OpenAI 那一个聊天接口地址。Claude Code 这类客户端走的是 Anthropic 那套（`/v1/messages`），新版 OpenAI SDK 和 Codex 走的是 Responses 那套（`/v1/responses`），照原来的网关接上来直接就是 404。现在两种都能直接打进来，共用同一套账号池、子钥匙和模型编排。
 
-| 端点 | 协议 | 说明 |
+| 接口地址 | 谁在用 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions | 原有接口，行为零变更 |
-| `POST /v1/responses` | **OpenAI Responses API** | `input` 支持字符串或消息数组；`instructions` → system；`max_output_tokens` → `max_tokens`；返回 `{object:"response", output:[...], status, usage}` |
-| `POST /v1/messages` | **Anthropic Messages API** | 标准 `messages` 数组 + `system`（字符串或 block 数组）+ `max_tokens`；返回 `{type:"message", content:[{type:"text"}], stop_reason, usage}` |
+| `POST /v1/chat/completions` | 绝大多数 OpenAI 兼容客户端 | 一直在用的那个，行为没动过 |
+| `POST /v1/responses` | 新版 OpenAI SDK / Codex | 提问内容写一句话或者一段多轮对话都行，另有系统提示词和最大输出长度，返回值按 Responses 规范给 |
+| `POST /v1/messages` | Claude Code 等 Anthropic 系客户端 | 多轮对话 + 系统提示 + 最大输出长度，返回值按 Messages 规范给 |
 
-**实现方式（零重复调度）**：入口把请求翻译成内部 chat 请求体内的等价形式，然后**原样走内部 `/v1/chat/completions` 全链路**（选号 / 轮换 / 冷却 / 编排降级 / 密钥鉴权 / 计费），再把响应（非流式整体转写、流式逐帧转 SSE）翻回目标协议。调度逻辑只有一份，两条新链路不重复实现任何选号代码。
+**怎么做的**：请求进来后先翻成内部聊天接口能看懂的样子，然后走同一条完整链路（挑账号 / 换号 / 冷却 / 编排降级 / 钥匙校验 / 记用量），最后把回答翻回对应协议的格式 —— 非流式一次性转写，流式按各协议的标准一段一段往外推。调度逻辑只有一份，两个新接口没有另起炉灶。
 
-- 流式：`/v1/messages` 输出 `message_start → content_block_start → ping → content_block_delta* → content_block_stop → message_delta → message_stop`；`/v1/responses` 输出 `response.created → response.output_item.added → response.content_part.added → response.output_text.delta* → response.output_text.done → response.output_item.done → response.completed`。
-- 鉴权与错误：鉴权沿用原 `api_key` 与 `wbk_` 子钥匙；错误按**入口协议**返回（`/v1/messages` 返回 Anthropic 形状 `{"type":"error","error":{...}}`，另两个返回 OpenAI 形状）。
-- 计费：与 chat 完全一致，走同一份用量统计与额度扣减。
-- 模型编排：`model=auto` 在三个端点上都生效，降级链与昼夜切换同样适用；实际命中的模型仍通过响应头 `X-WB2A-Routed-Model` 回传。
-- 不支持的字段（如 Responses 的 `tools` / `previous_response_id`、Messages 的 `thinking`）**静默忽略**，不报错。
+- **鉴权**：沿用原来的管理员钥匙和 `wbk_` 子钥匙；出错时按**你这个请求进的是哪个口**来返回错误格式，客户端不用额外适配。
+- **计费**：跟聊天接口完全一致，同一份用量统计、同一套额度扣减。
+- **模型编排**：传 `auto` / `cn:auto` 在三个接口上都生效，降级和昼夜切换照常；实际用了哪个模型，响应头里会带出来。
+- **用不上的参数直接忽略**，不报错。
 
 **怎么用**
 
 ```bash
-# OpenAI Responses API
+# 新版 OpenAI SDK / Codex 走这个
 curl http://HOST:7863/v1/responses \
   -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
   -d '{"model":"auto","input":"用一句话介绍自己"}'
 
-# Anthropic Messages API
+# Claude Code 等 Anthropic 系客户端走这个
 curl http://HOST:7863/v1/messages \
   -H "Authorization: Bearer <你的key>" \
   -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
   -d '{"model":"auto","max_tokens":1024,"messages":[{"role":"user","content":"用一句话介绍自己"}]}'
 ```
 
-Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:7863`，key 用 `wbk_` 子钥匙或管理员 key）。
-
-**新增文件**：`internal/server/compat.go`（转写框架 / 录制器 / SSE 发射）、`internal/server/compat_responses.go`、`internal/server/compat_messages.go`；路由注册在 `internal/server/handler.go`。
+Claude Code 把环境变量 `ANTHROPIC_BASE_URL` 填成网关地址就行（例如 `http://HOST:7863`），钥匙用子钥匙或管理员钥匙都可以，别的不用改。
 
 ---
 
@@ -246,19 +191,6 @@ Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:786
 | Web 管理面板（账号池 / 模型档位 / 在线改配置 / 日志） | [上游 README · Web 管理面板](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 | 完整配置项速查、环境变量覆盖、API 端点、错误分类 | [上游 README · 配置说明](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 
-合并上游新版本后，用 `git diff` 对照 `internal/apikeys/`、`internal/autoroute/`、`internal/server/compat*.go` 与 `internal/panel/keys.go` 四项，即可确认三项增强没被冲掉。
-
----
-
-## 安全与合规
-
-- **凭据**：`auths/` 存明文 token（0600），**切勿提交 git**（`.gitignore` 已排除 `auths/`、`data/`、`config.json`）
-- **公网部署**：服务只提供明文 HTTP，**必须置于 HTTPS 反向代理之后**并设置 `api_key`
-- **IP 白名单**：`trust_proxy` 默认 `false`，不读可伪造的 `X-Forwarded-For`
-- **合规**：非官方网关，仅限**本人授权账号**、本机 / 私有环境测试；遵守 CodeBuddy 服务条款，作者不对账号封禁或条款违约负责
-
----
-
 ## License
 
 [MIT](LICENSE)。再分发请保留原仓库 MIT 声明，注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`。本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利。
@@ -267,14 +199,14 @@ Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:786
 
 - 根项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
 - 直接上游：[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
-- 本仓库二改（2026-09）：**API 密钥分发**、**模型编排** 与 **协议兼容层**，新增代码：
+- 本仓库二改（2026-09）：**API 密钥分发**、**模型编排** 与 **多协议接入**，新增代码：
 
 | 新增文件 | 作用 |
 |---|---|
 | `internal/apikeys/apikeys.go` | 密钥库：签发 / 校验 / 额度 / 白名单 / 落盘 |
 | `internal/autoroute/autoroute.go` | 编排引擎：昼夜主模型 + 降级链展开 |
 | `internal/panel/keys.go` | 面板密钥管理接口 `/panel/api/keys` |
-| `internal/server/compat.go` | 协议兼容层：转写框架、响应录制器、SSE 事件发射、按协议分发错误 |
+| `internal/server/compat.go` | 多协议接入：转写框架、响应录制器、流式事件发射、按协议分发错误 |
 | `internal/server/compat_responses.go` | OpenAI Responses API 双向转写 |
 | `internal/server/compat_messages.go` | Anthropic Messages API 双向转写 |
 

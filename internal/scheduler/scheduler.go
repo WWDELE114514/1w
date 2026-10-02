@@ -29,11 +29,12 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
+	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
-	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
-	// entry.creditsExpiring）。<=0 时禁用分桶（全部归长期，行为与引入前一致）。
-	// 默认建议 7*24h。
+	// <= now+window 的套餐余额标记为"快过期"（pool 据此做最早到期优先，见
+	// entry.creditsEarliestExpiry）。<=0 时不做路由门槛；展示仍使用完整逐包数据。
 	ExpiringSoonWindow time.Duration
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
@@ -47,6 +48,13 @@ type Config struct {
 	KeepaliveDisabled bool
 	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
 	BlackcatDisabled bool
+	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
+	GrowthDisabled bool
+
+	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
+	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
+	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
+	GrowthHook func()
 }
 
 // Scheduler 调度器。
@@ -95,10 +103,40 @@ func New(cfg Config) *Scheduler {
 	}
 }
 
+// ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
+func (s *Scheduler) ExpiringSoonWindow() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.ExpiringSoonWindow
+}
+
+// SetExpiringSoonWindow 热更新快过期路由窗口。窗口变化时清空池内旧快照，避免在下一轮
+// 余额刷新覆盖前，继续用旧窗口得出的最早到期顺序选号。
+func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.schedMu.Lock()
+	changed := s.cfg.ExpiringSoonWindow != d
+	s.cfg.ExpiringSoonWindow = d
+	poolRef := s.cfg.Pool
+	s.schedMu.Unlock()
+	if changed && poolRef != nil {
+		poolRef.ClearExpiringSnapshots()
+	}
+}
+
 // Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
 // 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
-func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
-	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool) {
+// SetGrowthHook 挂载/替换成长任务队列回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetGrowthHook(fn func()) {
+	s.schedMu.Lock()
+	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
+	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, growthDisabled bool) {
 	s.schedMu.Lock()
 	if len(checkinHours) > 0 {
 		s.cfg.CheckinHours = checkinHours
@@ -115,11 +153,15 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	if len(blackcatHours) > 0 {
 		s.cfg.BlackcatHours = blackcatHours
 	}
+	if len(growthHours) > 0 {
+		s.cfg.GrowthHours = growthHours
+	}
 	s.cfg.CheckinDisabled = checkinDisabled
 	s.cfg.TravelDisabled = travelDisabled
 	s.cfg.ActivityDisabled = activityDisabled
 	s.cfg.KeepaliveDisabled = keepaliveDisabled
 	s.cfg.BlackcatDisabled = blackcatDisabled
+	s.cfg.GrowthDisabled = growthDisabled
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)
 	poke(s.rearmBalance)
@@ -157,6 +199,7 @@ const (
 	taskActivity
 	taskKeepalive
 	taskBlackcat
+	taskGrowth
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -168,6 +211,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
 	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
+	growthHours, growthOff := s.cfg.GrowthHours, s.cfg.GrowthDisabled
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
 	s.schedMu.Unlock()
 
@@ -190,6 +234,9 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !blackcatOff {
 		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
+	}
+	if !growthOff {
+		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -235,6 +282,57 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 	return sleepCtx(ctx, wakeupGraceDelay)
 }
 
+// wallclockCheckStep 墙钟校验段长：等待槽位时单次 timer 的最大时长，每段醒来用
+// 墙钟重判是否到点。值是「时点精度」与「空闲唤醒频率」的折中——60s 段内时点
+// 偏差上限 60s，对签到/保活类任务足够。
+const wallclockCheckStep = time.Minute
+
+// slotWake waitSlot 的三态结果。
+type slotWake int
+
+const (
+	slotFired slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                 // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                // ctx 取消：上层优雅退出
+)
+
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
+// 不携带单调读数，time.Until 对它是纯墙钟差）。
+//
+// 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
+// macOS / Windows Modern Standby 睡眠会冻结它——睡眠时长不足整个等待时，fire
+// 被顺延「睡眠时长」（墙钟已过点、timer 还要继续等），时点被错过且不会立即补跑；
+// 睡眠时长超过整个等待时倒是无害的（唤醒瞬间 timer 到期，awaitWakeupGrace 补跑）。
+// 分段睡、每段醒来用墙钟重判，把冻结的影响限制在一段之内：睡眠结束后的第一段
+// 末尾必然发现「墙钟已越过时点」并立即补跑，偏差上限 = step + 睡眠落段余量。
+//
+// ctx 取消 / rearmSchedule（在线改配置重排）在每段的 select 里随时返回，段长
+// 不影响两者响应性。返回三态见 slotWake。
+func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	for {
+		wallRemain := time.Until(next)
+		if wallRemain <= 0 {
+			return slotFired
+		}
+		d := wallRemain
+		if d > step {
+			d = step
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return slotCancel
+		case <-s.rearmSchedule:
+			timer.Stop()
+			return slotRearm
+		case <-timer.C:
+			// 段末回到循环顶用墙钟重判：正常推进时若干段后到点；单调时钟被
+			// 睡眠冻结时，墙钟大幅前进，至多一段之后即到点补跑。
+		}
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -249,14 +347,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		switch s.waitSlot(ctx, next, wallclockCheckStep) {
+		case slotCancel:
 			return
-		case <-s.rearmSchedule:
-			timer.Stop() // 排程已变：重算下一次唤醒
-		case <-timer.C:
+		case slotRearm:
+			continue // 排程已变：重算下一次唤醒
+		case slotFired:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
 			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
@@ -292,6 +388,14 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.RunKeepaliveNow()
 			case taskBlackcat:
 				s.RunBlackcatNow()
+			case taskGrowth:
+				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
+				s.schedMu.Lock()
+				hook := s.cfg.GrowthHook
+				s.schedMu.Unlock()
+				if hook != nil {
+					hook()
+				}
 			}
 		}(k)
 	}
@@ -320,6 +424,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -337,31 +442,34 @@ func (s *Scheduler) RunCheckinNow() {
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
+				s.cfg.Pool.NoteCheckinDone(st.UID)
 				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 			} else {
 				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 			// 其余业务错误也继续走余额查询
+		} else {
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
-		}
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
-	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
-// 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
+// CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上
+// code=0 OK，点亮连登）；一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
@@ -381,9 +489,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
-		if a.IsGlobal() {
-			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
-		}
+		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
+		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切，
+		// 无需改动 upstream。此处曾按「D4 门控：global 无活跃体系」跳过 global，实测该
+		// 判断不成立——国际版 /v2/report 可用，跳过即国际版账号永远点不亮连登（上游
+		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
@@ -456,6 +566,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
+	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -467,16 +578,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 				return
 			}
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			} else {
-				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			}
+			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 		}(a, st.UID)
 	}
 	wg.Wait()
